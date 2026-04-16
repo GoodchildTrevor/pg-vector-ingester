@@ -8,21 +8,21 @@ from more_itertools import chunked
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from pg_ingester.models import File, Message
+from pg_ingester.models import Message
 
 logger = logging.getLogger(__name__)
 
 
-async def fetch_messages_for_file(
+async def fetch_messages_by_ids(
     session: AsyncSession,
-    file_id: uuid.UUID,
+    message_ids: Sequence[uuid.UUID],
     force_reembed: bool = False,
 ) -> list[Message]:
-    """Return messages belonging to file_id.
+    """Return messages matching the given IDs.
 
     If force_reembed is False, only returns rows where embedding IS NULL.
     """
-    stmt = select(Message).where(Message.file_id == file_id)
+    stmt = select(Message).where(Message.id.in_(message_ids))
     if not force_reembed:
         stmt = stmt.where(Message.embedding.is_(None))
     result = await session.execute(stmt)
@@ -31,12 +31,12 @@ async def fetch_messages_for_file(
 
 async def fetch_messages_without_embedding(
     session: AsyncSession,
-    file_id: uuid.UUID | None = None,
+    user_id: str | None = None,
 ) -> list[Message]:
-    """Return ALL messages where embedding IS NULL, optionally filtered by file."""
+    """Return ALL messages where embedding IS NULL, optionally filtered by user."""
     stmt = select(Message).where(Message.embedding.is_(None))
-    if file_id is not None:
-        stmt = stmt.where(Message.file_id == file_id)
+    if user_id is not None:
+        stmt = stmt.where(Message.user_id == user_id)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -49,8 +49,7 @@ async def save_embeddings(
 ) -> int:
     """Bulk-update messages.embedding in batches. Returns number of updated rows."""
     updated = 0
-    pairs = list(zip(message_ids, vectors))
-    for batch in chunked(pairs, insert_batch_size):
+    for batch in chunked(zip(message_ids, vectors), insert_batch_size):
         for msg_id, vec in batch:
             await session.execute(
                 update(Message)
@@ -62,20 +61,3 @@ async def save_embeddings(
         logger.debug("Saved embedding batch of %d", len(batch))
     logger.info("Updated embeddings for %d messages", updated)
     return updated
-
-
-async def set_file_status(
-    session: AsyncSession,
-    file_id: uuid.UUID,
-    status: str,
-    error_message: str | None = None,
-) -> None:
-    """Update files.status (and optionally files.error_message)."""
-    values: dict = {"status": status}
-    if error_message is not None:
-        values["error_message"] = error_message
-    await session.execute(
-        update(File).where(File.id == file_id).values(**values)
-    )
-    await session.commit()
-    logger.info("File %s status -> %s", file_id, status)

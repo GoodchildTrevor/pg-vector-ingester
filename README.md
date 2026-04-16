@@ -12,7 +12,7 @@ into PostgreSQL so that similar past conversations can be found via vector simil
 
 When the assistant resolves a user's problem after several iterations, the full conversation
 is stored in the `messages` table. By embedding each message, the agent can later find
-semanticaly similar past dialogues and jump straight to the solution — without repeating
+semantically similar past dialogues and jump straight to the solution — without repeating
 the entire reasoning chain.
 
 ```sql
@@ -45,13 +45,13 @@ projects/
 dialogue-agent
   │
   ├── POST /ingest  ──►  pg-vector-ingester /ingest
-  │                        1. Load messages by file_id (WHERE embedding IS NULL)
+  │                        1. Load messages by message_ids (WHERE embedding IS NULL)
   │                        2. Embed message.content via fastembed dense model
   │                        3. UPDATE messages SET embedding = $vec  (pgvector)
-  │                        4. SET files.status = 'indexed'
   │
   └── POST /sync   ──►  pg-vector-ingester /sync
                            Find ALL messages WHERE embedding IS NULL → embed
+                           Optionally scoped to a single user_id
                            Use for recovery after partial failures or DB bootstrap
 ```
 
@@ -60,17 +60,21 @@ dialogue-agent
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness check |
-| POST | `/ingest` | Embed messages for a specific file |
+| POST | `/ingest` | Embed a specific list of messages by their IDs |
 | POST | `/sync` | Incremental re-embed of all NULL embeddings |
 
 ### `POST /ingest`
 
-Matches the `PgIngesterClient.trigger_ingestion` contract in `dialogue-agent`.
+Caller (dialogue-agent) passes the exact `message_ids` it wants embedded.
+Status updates on `files` are **not** the responsibility of this service.
 
 ```json
 // Request
 {
-  "source_id": "<file_id UUID>",
+  "message_ids": [
+    "<message UUID>",
+    "<message UUID>"
+  ],
   "options": {
     "force_reembed": false,
     "batch_size": 32
@@ -79,7 +83,6 @@ Matches the `PgIngesterClient.trigger_ingestion` contract in `dialogue-agent`.
 
 // Response
 {
-  "source_id": "<file_id UUID>",
   "messages_embedded": 42,
   "messages_skipped": 0
 }
@@ -88,8 +91,8 @@ Matches the `PgIngesterClient.trigger_ingestion` contract in `dialogue-agent`.
 ### `POST /sync`
 
 ```json
-// Request  (file_id null = global sync)
-{ "file_id": "<UUID or null>" }
+// Request  (user_id null = global sync)
+{ "user_id": "<string or null>" }
 
 // Response
 { "re_embedded": 7, "skipped": 0 }
@@ -131,5 +134,5 @@ pg_ingester/
 ├── models.py        # Minimal SQLAlchemy projection of dialogue-agent tables
 ├── schemas.py       # Pydantic request/response models
 ├── embedder.py      # fastembed in thread pool (run_in_executor)
-└── loader.py        # fetch_messages, save_embeddings, set_file_status
+└── loader.py        # fetch_messages_by_ids, save_embeddings
 ```

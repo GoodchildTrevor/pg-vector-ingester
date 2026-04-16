@@ -10,10 +10,9 @@ from pg_ingester.config import get_settings, get_dense_model
 from pg_ingester.db import init_db, get_session
 from pg_ingester.embedder import embed_texts
 from pg_ingester.loader import (
-    fetch_messages_for_file,
+    fetch_messages_by_ids,
     fetch_messages_without_embedding,
     save_embeddings,
-    set_file_status,
 )
 from pg_ingester.schemas import (
     IngestRequest, IngestResponse,
@@ -30,7 +29,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="pg-vector-ingester", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="pg-vector-ingester", version="0.2.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -44,43 +43,33 @@ async def ingest(
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Embed all messages for a given file and persist vectors into PostgreSQL.
+    Embed a specific list of messages and persist vectors into PostgreSQL.
 
     Pipeline:
-    1. Load messages for file_id (only NULL embeddings unless force_reembed)
+    1. Load messages by message_ids (only NULL embeddings unless force_reembed)
     2. Embed message.content via fastembed dense model
     3. Bulk-UPDATE messages.embedding in batches
-    4. Set files.status = 'indexed'
     """
     settings = get_settings()
     model = get_dense_model()
-    file_id = request.file_id
     batch_size = request.batch_size_override or settings.batch_size
 
-    # Step 1 — load messages
-    messages = await fetch_messages_for_file(
-        session, file_id, force_reembed=request.force_reembed
+    # Step 1 — load
+    messages = await fetch_messages_by_ids(
+        session, request.message_ids, force_reembed=request.force_reembed
     )
-    skipped_count = 0
+    skipped = len(request.message_ids) - len(messages)
+
     if not messages:
-        logger.info("No messages to embed for file %s", file_id)
-        if not request.force_reembed:
-            # all messages already have embeddings
-            skipped_count_stmt = await fetch_messages_for_file(session, file_id, force_reembed=True)
-            skipped_count = len(skipped_count_stmt)
-        return IngestResponse(
-            source_id=file_id,
-            messages_embedded=0,
-            messages_skipped=skipped_count,
-        )
+        logger.info("No messages to embed (all %d already have embeddings)", skipped)
+        return IngestResponse(messages_embedded=0, messages_skipped=skipped)
 
     # Step 2 — embed
     texts = [m.content for m in messages]
     try:
         vectors = await embed_texts(texts, model, batch_size=batch_size)
     except Exception as exc:
-        logger.error("Embedding failed for file %s: %s", file_id, exc)
-        await set_file_status(session, file_id, "error", error_message=str(exc))
+        logger.error("Embedding failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Embedding error: {exc}")
 
     # Step 3 — persist
@@ -92,18 +81,10 @@ async def ingest(
             insert_batch_size=settings.insert_batch_size,
         )
     except Exception as exc:
-        logger.error("DB update failed for file %s: %s", file_id, exc)
-        await set_file_status(session, file_id, "error", error_message=str(exc))
+        logger.error("DB update failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"DB update error: {exc}")
 
-    # Step 4 — mark file as indexed
-    await set_file_status(session, file_id, "indexed")
-
-    return IngestResponse(
-        source_id=file_id,
-        messages_embedded=embedded,
-        messages_skipped=0,
-    )
+    return IngestResponse(messages_embedded=embedded, messages_skipped=skipped)
 
 
 @app.post("/sync", response_model=SyncResponse)
@@ -114,13 +95,13 @@ async def sync(
     """
     Incremental sync: find all messages with embedding IS NULL and embed them.
 
-    Scoped to a single file if file_id is provided, otherwise global.
+    Scoped to a single user if user_id is provided, otherwise global.
     Use this to recover after partial failures or to bootstrap a fresh DB.
     """
     settings = get_settings()
     model = get_dense_model()
 
-    messages = await fetch_messages_without_embedding(session, file_id=request.file_id)
+    messages = await fetch_messages_without_embedding(session, user_id=request.user_id)
     if not messages:
         return SyncResponse(re_embedded=0, skipped=0)
 
