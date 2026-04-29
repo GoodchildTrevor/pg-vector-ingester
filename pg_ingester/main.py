@@ -13,6 +13,7 @@ from pg_ingester.loader import (
     fetch_messages_by_ids,
     fetch_messages_without_embedding,
     save_embeddings,
+    SYNC_PAGE_SIZE,
 )
 from pg_ingester.schemas import (
     IngestRequest, IngestResponse,
@@ -29,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="pg-vector-ingester", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="pg-vector-ingester", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -48,13 +49,12 @@ async def ingest(
     Pipeline:
     1. Load messages by message_ids (only NULL embeddings unless force_reembed)
     2. Embed message.content via fastembed dense model
-    3. Bulk-UPDATE messages.embedding in batches
+    3. Bulk-UPDATE messages.embedding in batches via UPDATE ... FROM (VALUES ...)
     """
     settings = get_settings()
     model = get_dense_model()
     batch_size = request.batch_size_override or settings.batch_size
 
-    # Step 1 — load
     messages = await fetch_messages_by_ids(
         session, request.message_ids, force_reembed=request.force_reembed
     )
@@ -64,7 +64,6 @@ async def ingest(
         logger.info("No messages to embed (all %d already have embeddings)", skipped)
         return IngestResponse(messages_embedded=0, messages_skipped=skipped)
 
-    # Step 2 — embed
     texts = [m.content for m in messages]
     try:
         vectors = await embed_texts(texts, model, batch_size=batch_size)
@@ -72,7 +71,6 @@ async def ingest(
         logger.error("Embedding failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Embedding error: {exc}")
 
-    # Step 3 — persist
     try:
         embedded = await save_embeddings(
             session,
@@ -95,28 +93,38 @@ async def sync(
     """
     Incremental sync: find all messages with embedding IS NULL and embed them.
 
-    Scoped to a single user if user_id is provided, otherwise global.
-    Use this to recover after partial failures or to bootstrap a fresh DB.
+    Processes messages in pages of SYNC_PAGE_SIZE to avoid loading the entire
+    table into RAM. Scoped to a single user if user_id is provided.
     """
     settings = get_settings()
     model = get_dense_model()
+    total_embedded = 0
+    offset = 0
 
-    messages = await fetch_messages_without_embedding(session, user_id=request.user_id)
-    if not messages:
-        return SyncResponse(re_embedded=0, skipped=0)
+    while True:
+        messages = await fetch_messages_without_embedding(
+            session,
+            user_id=request.user_id,
+            limit=SYNC_PAGE_SIZE,
+            offset=offset,
+        )
+        if not messages:
+            break
 
-    texts = [m.content for m in messages]
-    try:
-        vectors = await embed_texts(texts, model, batch_size=settings.batch_size)
-    except Exception as exc:
-        logger.error("Sync embedding failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}")
+        texts = [m.content for m in messages]
+        try:
+            vectors = await embed_texts(texts, model, batch_size=settings.batch_size)
+        except Exception as exc:
+            logger.error("Sync embedding failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Embedding error: {exc}")
 
-    re_embedded = await save_embeddings(
-        session,
-        message_ids=[m.id for m in messages],
-        vectors=vectors,
-        insert_batch_size=settings.insert_batch_size,
-    )
+        embedded = await save_embeddings(
+            session,
+            message_ids=[m.id for m in messages],
+            vectors=vectors,
+            insert_batch_size=settings.insert_batch_size,
+        )
+        total_embedded += embedded
+        offset += SYNC_PAGE_SIZE
 
-    return SyncResponse(re_embedded=re_embedded, skipped=0)
+    return SyncResponse(re_embedded=total_embedded, skipped=0)

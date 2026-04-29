@@ -14,6 +14,9 @@ from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+# Dimension of sentence-transformers/paraphrase-multilingual-mpnet-base-v2
+EMBEDDING_DIM = 768
+
 
 class Base(DeclarativeBase):
     pass
@@ -42,6 +45,8 @@ class Message(Base):
         nullable=True,
         index=True,
     )
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(), nullable=True)
+    # Fixed dimension required for HNSW / IVFFlat index creation
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM), nullable=True)

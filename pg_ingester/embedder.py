@@ -20,7 +20,7 @@ async def embed_texts(
     Runs synchronous fastembed in a thread pool to avoid blocking the event loop.
     Returns a list of float vectors in the same order as *texts*.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _embed_sync() -> list[list[float]]:
         results: list[list[float]] = []
